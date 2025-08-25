@@ -1,0 +1,341 @@
+---
+title: "travel_distance_2009_2025"
+author: '49595'
+date: "2025-06-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, eval=FALSE}
+# Load in libraries
+library(tidyverse)
+library(dplyr)
+library(readxl)
+library(stringr)
+library(fixest)
+library(did)
+```
+
+```{r travel-distances&abortion-counts}
+## Clean and prepare controls data set ##
+
+# Load in controls data
+raw_data_controls <- read_excel("../data_raw/foranalysis_countyxyear_public.xlsx")
+
+# Remove all variables that aren't controls
+raw_data_controls <- raw_data_controls %>% select(-county_name, -abortions_total, -arate, -td, -dest_asp, -td_fips_code_jan1, 
+                                                  -td_jan1, -td_city_jan1, -td_state_jan1, -td_fips_code_july1, -td_july1, -td_city_july1, -td_state_july1, -td_fips_code_aug1, -td_aug1, -td_city_aug1, -td_state_aug1)
+
+control_vars <- setdiff(names(raw_data_controls), c("fips_code", "year"))
+
+# Split
+controls_2020 <- raw_data_controls %>% filter(year == 2020)
+controls_2021 <- raw_data_controls %>% filter(year == 2021)
+
+# Prefer 2021 if any non-missing
+preferred_controls <- controls_2021 %>%
+  rowwise() %>%
+  mutate(non_missing = any(!is.na(c_across(all_of(control_vars))))) %>%
+  ungroup()
+
+# Get best available controls
+fill_control_values <- preferred_controls %>%
+  filter(non_missing) %>%
+  select(-non_missing) %>%
+  bind_rows(
+    controls_2020 %>%
+      filter(!(fips_code %in% preferred_controls$fips_code[preferred_controls$non_missing]))
+  )
+
+# Copy forward to 2021–2023
+filled_rows <- expand.grid(
+  fips_code = unique(fill_control_values$fips_code),
+  year = 2021:2023
+) %>%
+  left_join(
+    fill_control_values %>% filter(year == 2021 | year == 2020) %>% select(-year),
+    by = "fips_code"
+  ) %>%
+  select(any_of(c("fips_code", "year", control_vars)))
+
+# Recombine
+cleaned_controls_data <- raw_data_controls %>%
+  filter(!(year %in% 2021:2023)) %>%
+  bind_rows(filled_rows) %>%
+  arrange(fips_code, year)
+
+cleaned_controls_data <- cleaned_controls_data %>%
+  group_by(fips_code) %>%
+  arrange(year) %>%
+  fill(all_of(control_vars), .direction = "down") %>%
+  ungroup()
+
+## Merge abortions & births data set to travel distances df ##
+
+# Load in travel distances and abortion/birth data sets
+td_data <- read_excel("../data_raw/2025.04.01_abortionaccess_countyxmonth_CaitlinMyers.xlsx")
+td_data <- td_data %>%   # Add leading zero for fips_codes that are not 5 digits long.
+  mutate(origin_fips_code = if_else(
+    nchar(origin_fips_code) == 4,
+    str_pad(origin_fips_code, width = 5, side = "left", pad = "0"),
+    as.character(origin_fips_code)
+  ))
+td_data <- td_data %>% filter(month == 12) %>% select(origin_fips_code, origin_county_name, year, distance_origintodest)
+td_data <- td_data %>% rename(fips_code = origin_fips_code) %>% rename(county_name = origin_county_name)
+
+abortion_birth_data <- read_excel("../data_raw/County Abortion and Birth Counts 2009-2023.xlsx", range = cell_cols(c(1, 2, 3, 4, 5)))
+
+# Merge all data sets (abortion/birth, td, controls)
+abortions_births_td <- td_data %>%
+  left_join(abortion_birth_data, by = c("fips_code", "county_name", "year"))
+abortions_births_td <- abortions_births_td %>% filter(year != 2024)
+
+abortions_births_td_controls <- abortions_births_td %>% 
+  left_join(cleaned_controls_data, by = c("fips_code", "year"))
+```
+
+```{r DiD-clinical-abortions}
+
+## TWFE DiD Clinical Abortions ##
+
+# Remove birth data from merged data set
+abortion_data <- abortions_births_td_controls %>% select(-births_total)
+abortion_data <- abortion_data %>%
+  mutate(abortions_total = ifelse(is.na(abortions_total), 0, abortions_total))
+
+# Define the states to keep
+states_to_keep_abortions <- c("AL", "AZ", "DE", "IN", "MN", "MO", "NV", "NC", "OH", "OR", "PA", "SD", "TX", "VT")
+
+# Set regex pattern matching any of state abbreviations at end of string
+state_pattern <- paste0("\\(", states_to_keep_abortions, "\\)", collapse = "|")
+
+# Filter to keep only rows where county_name ends in a target states
+abortion_data <- abortion_data %>%
+  filter(str_detect(county_name, state_pattern))
+
+# Prepare DiD so that distance = 100s of miles and log female pop as control
+abortion_data <- abortion_data %>%
+  mutate(
+    distance_100 = distance_origintodest / 100,
+    log_female_pop = log(pop_total)
+  )
+
+# Log abortions to be normalized (not right skewed)
+abortion_data <- abortion_data %>%
+  mutate(log_abortions = log(abortions_total + 1))
+
+# Run TWFE linear model for abortion counts
+twfe_abortions <- feols(
+  log_abortions ~
+    distance_100 + I(distance_100^2) +
+    log_female_pop +
+    
+    # Demographic controls
+    pct_white_1519 + pct_white_2024 + pct_white_2529 +
+    pct_white_3034 + pct_white_3539 + pct_white_4044 +
+    pct_black_1519 + pct_black_2024 + pct_black_2529 +
+    pct_black_3034 + pct_black_3539 + pct_black_4044 +
+    pct_hispanic_1519 + pct_hispanic_2024 + pct_hispanic_2529 +
+    pct_hispanic_3034 + pct_hispanic_3539 + pct_hispanic_4044 +
+
+    pct_edlths + pct_edhs + pct_edscoll + pct_edcoll +
+    pct_urban +
+    
+    # Economic controls
+    urate + pctpoverty + medincome +
+    
+    # Policy controls
+    E_mwx1trip + E_mwx2trip + E_fpmedexp + E_insmand +
+    medicaid_expansion + real_maxben + familycap |
+    
+    # Fixed effects 
+    fips_code + year,
+  
+  data = abortion_data,
+  cluster = ~fips_code
+)
+
+# Results
+summary(twfe_abortions)
+etable(twfe_abortions, se = "cluster", cluster = ~fips_code)
+```
+
+
+```{r DiD-births}
+## TWFE DiD Births ##
+
+# Remove abortion data from merged data set
+birth_data <- abortions_births_td_controls %>% select(-abortions_total)
+birth_data <- birth_data %>%
+  mutate(births_total = ifelse(is.na(births_total), 0, births_total))
+
+# Define the states to keep
+states_to_keep_births <- c("AL", "AZ", "CO", "CT", "DE", "FL", "GA", "ID", "IA", "ME", "MA", "MI", "MN", "MO", "MT", "NV", "NH", "NJ", "NM", "NC", "ND", "OR", "OK", "PA", "SD", "VT", "WI", "WY")
+
+# Set regex pattern matching any of state abbreviations at end of string
+state_pattern <- paste0("\\(", states_to_keep_births, "\\)", collapse = "|")
+
+# Filter to keep only rows where county_name ends in a target states
+birth_data <- birth_data %>%
+  filter(str_detect(county_name, state_pattern)) 
+birth_data <- birth_data %>%
+  mutate(births_total = as.numeric(gsub(",", "", births_total)))
+
+# Prepare DiD so that distance = 100s of miles and log female pop as control
+birth_data <- birth_data %>%
+  mutate(
+    distance_100 = distance_origintodest / 100,
+    log_female_pop = log(pop_total)
+  )
+
+# Log births to be normalized (not right skewed)
+birth_data <- birth_data %>%
+  mutate(log_births = log(births_total + 1))
+
+# Run TWFE linear model for abortion counts
+twfe_births <- feols(
+  log_births ~
+    distance_100 + I(distance_100^2) +
+    log_female_pop +
+    
+    # Demographic controls
+    pct_white_1519 + pct_white_2024 + pct_white_2529 +
+    pct_white_3034 + pct_white_3539 + pct_white_4044 +
+    pct_black_1519 + pct_black_2024 + pct_black_2529 +
+    pct_black_3034 + pct_black_3539 + pct_black_4044 +
+    pct_hispanic_1519 + pct_hispanic_2024 + pct_hispanic_2529 +
+    pct_hispanic_3034 + pct_hispanic_3539 + pct_hispanic_4044 +
+
+    pct_edlths + pct_edhs + pct_edscoll +
+    pct_urban +
+    
+    # Economic controls
+    urate + pctpoverty + medincome +
+    
+    # Policy controls
+    E_mwx1trip + E_mwx2trip + E_fpmedexp + E_insmand +
+    medicaid_expansion + real_maxben + familycap |
+    
+    # Fixed effects 
+    fips_code + year,
+  
+  data = birth_data,
+  cluster = ~fips_code
+)
+
+# Results
+summary(twfe_births)
+etable(twfe_births, se = "cluster", cluster = ~fips_code)
+```
+
+
+Event Study Models for TWFE DiD Models on Clinical Abortions and Births 
+
+``` {r event-study-clinical-abortions}
+## Event Study Clinical Abortions ##
+
+# Assign treatment year
+abortion_data <- abortion_data %>%
+  mutate(fips_code = as.character(fips_code))
+
+distance_wide <- abortion_data %>%
+  filter(year %in% c(2021, 2022, 2023)) %>%
+  group_by(fips_code, year) %>%
+  summarise(distance = mean(distance_origintodest, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from = year,
+    values_from = distance,
+    names_prefix = "distance_"
+  )
+
+first_treatment_years <- distance_wide %>%
+  mutate(
+    treat_year = case_when(
+      !is.na(distance_2021) & !is.na(distance_2022) & distance_2022 != distance_2021 ~ 2022,
+      !is.na(distance_2021) & !is.na(distance_2023) & distance_2023 != distance_2021 ~ 2023,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(fips_code, treat_year)
+
+# Join back and prepare data
+abortion_data_es <- abortion_data %>%
+  left_join(first_treatment_years, by = "fips_code") %>%
+  arrange(fips_code, year)
+abortion_data_es <- abortion_data_es %>%
+  mutate(fips_code = as.numeric(fips_code))
+
+# Run event-study DiD for Clinical Abortions
+cs_att_clinical_abortions <- att_gt(
+  yname = "log_abortions",
+  tname = "year",
+  idname = "fips_code",
+  gname = "treat_year",
+  xformla = ~ log_female_pop,
+  data = abortion_data_es,
+  est_method = "dr",
+  control_group = "notyettreated",
+  allow_unbalanced_panel = TRUE
+)
+
+# STEP 4: Plot dynamic ATT for 2022 treated group
+ggdid(cs_att_clinical_abortions, group = 2022)
+```
+
+```{r event-study-births}
+## Event Study Births ##
+
+# Assign treatment year
+birth_data <- birth_data %>%
+  mutate(fips_code = as.character(fips_code))
+
+distance_wide <- birth_data %>%
+  filter(year %in% c(2021, 2022, 2023)) %>%
+  group_by(fips_code, year) %>%
+  summarise(distance = mean(distance_origintodest, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from = year,
+    values_from = distance,
+    names_prefix = "distance_"
+  )
+
+first_treatment_years <- distance_wide %>%
+  mutate(
+    treat_year = case_when(
+      !is.na(distance_2021) & !is.na(distance_2022) & distance_2022 != distance_2021 ~ 2022,
+      !is.na(distance_2021) & !is.na(distance_2023) & distance_2023 != distance_2021 ~ 2023,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(fips_code, treat_year)
+
+# Join back and prepare data
+birth_data_es <- birth_data %>%
+  left_join(first_treatment_years, by = "fips_code") %>%
+  arrange(fips_code, year)
+
+birth_data_es <- birth_data_es %>%
+  mutate(fips_code = as.numeric(fips_code))
+
+# Run event-study DiD for Clinical Abortions
+cs_att_births <- att_gt(
+  yname = "log_births",
+  tname = "year",
+  idname = "fips_code",
+  gname = "treat_year",
+  xformla = ~ log_female_pop,
+  data = birth_data_es,
+  est_method = "dr",
+  control_group = "notyettreated",
+  allow_unbalanced_panel = TRUE
+)
+
+# STEP 4: Plot dynamic ATT for 2022 treated group
+ggdid(cs_att, group = 2022)
+```
+
+
+

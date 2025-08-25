@@ -1,0 +1,1036 @@
+---
+title: "travel_distance_2009_2023"
+author: '49595'
+date: "2025-06-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, eval=FALSE}
+# Load in libraries
+library(tidyverse)
+library(dplyr)
+library(readxl)
+library(stringr)
+library(ggplot2)
+library(fixest)
+library(did)
+library(broom)
+library(knitr)
+library(lmtest)
+library(car)
+library(caret)
+library(cobalt)
+library(fect)
+```
+
+```{r travel-distances&abortion-counts}
+## Clean and prepare controls data set ##
+
+# Load in controls data
+raw_data_controls <- read_excel("../data_raw/foranalysis_countyxyear_public.xlsx")
+
+# Remove all variables that aren't controls
+raw_data_controls <- raw_data_controls %>% select(-county_name, -abortions_total, -arate, -td, -dest_asp, -td_fips_code_jan1, 
+                                                  -td_jan1, -td_city_jan1, -td_state_jan1, -td_fips_code_july1, -td_july1, -td_city_july1, -td_state_july1, -td_fips_code_aug1, -td_aug1, -td_city_aug1, -td_state_aug1)
+
+control_vars <- setdiff(names(raw_data_controls), c("fips_code", "year"))
+
+# Split
+controls_2020 <- raw_data_controls %>% filter(year == 2020)
+controls_2021 <- raw_data_controls %>% filter(year == 2021)
+
+# Prefer 2021 if any non-missing
+preferred_controls <- controls_2021 %>%
+  rowwise() %>%
+  mutate(non_missing = any(!is.na(c_across(all_of(control_vars))))) %>%
+  ungroup()
+
+# Get best available controls
+fill_control_values <- preferred_controls %>%
+  filter(non_missing) %>%
+  select(-non_missing) %>%
+  bind_rows(
+    controls_2020 %>%
+      filter(!(fips_code %in% preferred_controls$fips_code[preferred_controls$non_missing]))
+  )
+
+# Copy forward to 2021–2023
+filled_rows <- expand.grid(
+  fips_code = unique(fill_control_values$fips_code),
+  year = 2021:2023
+) %>%
+  left_join(
+    fill_control_values %>% filter(year == 2021 | year == 2020) %>% select(-year),
+    by = "fips_code"
+  ) %>%
+  select(any_of(c("fips_code", "year", control_vars)))
+
+# Recombine
+cleaned_controls_data <- raw_data_controls %>%
+  filter(!(year %in% 2021:2023)) %>%
+  bind_rows(filled_rows) %>%
+  arrange(fips_code, year)
+
+cleaned_controls_data <- cleaned_controls_data %>%
+  group_by(fips_code) %>%
+  arrange(year) %>%
+  fill(all_of(control_vars), .direction = "down") %>%
+  ungroup()
+
+## Merge abortions & births data set to travel distances df ##
+
+# Load in travel distances and abortion/birth data sets
+td_data <- read_excel("../data_raw/2025.04.01_abortionaccess_countyxmonth_CaitlinMyers.xlsx")
+td_data <- td_data %>%   # Add leading zero for fips_codes that are not 5 digits long.
+  mutate(origin_fips_code = if_else(
+    nchar(origin_fips_code) == 4,
+    str_pad(origin_fips_code, width = 5, side = "left", pad = "0"),
+    as.character(origin_fips_code)
+  ))
+td_data <- td_data %>% filter(month == 12) %>% select(origin_fips_code, origin_county_name, year, distance_origintodest)
+td_data <- td_data %>% rename(fips_code = origin_fips_code) %>% rename(county_name = origin_county_name)
+
+abortion_birth_data <- read_excel("../data_raw/County Abortion and Birth Counts 2009-2023.xlsx", range = cell_cols(c(1, 2, 3, 4, 5)))
+
+# Merge all data sets (abortion/birth, td, controls)
+abortions_births_td <- td_data %>%
+  left_join(abortion_birth_data, by = c("fips_code", "county_name", "year"))
+abortions_births_td <- abortions_births_td %>% filter(year != 2024)
+
+abortions_births_td_controls <- abortions_births_td %>% 
+  left_join(cleaned_controls_data, by = c("fips_code", "year"))
+```
+
+```{r DiD-clinical-abortions}
+
+## TWFE DiD Clinical Abortions ##
+
+# Remove birth data from merged data set
+abortion_data <- abortions_births_td_controls %>% select(-births_total)
+abortion_data <- abortion_data %>%
+  mutate(abortions_total = ifelse(is.na(abortions_total), 0, abortions_total))
+
+# Define the states to keep
+states_to_keep_abortions <- c("AL", "AZ", "DE", "IN", "MI", "MN", "MO", "NV", "NC", "OH", "OR", "PA", "SD", "TX", "VT")
+
+# Set regex pattern matching any of state abbreviations at end of string
+state_pattern <- paste0("\\(", states_to_keep_abortions, "\\)", collapse = "|")
+
+# Filter to keep only rows where county_name ends in a target states
+abortion_data <- abortion_data %>%
+  filter(str_detect(county_name, state_pattern))
+
+# Prepare DiD so that distance = 100s of miles and log female pop as control
+abortion_data <- abortion_data %>%
+  mutate(
+    distance_100 = distance_origintodest / 100,
+    log_female_pop = log(pop_total)
+  )
+
+# Log abortions to be normalized (not right skewed)
+abortion_data <- abortion_data %>%
+  mutate(log_abortions = log(abortions_total + 1))
+
+# Run TWFE linear model for abortion counts
+twfe_abortions <- feols(
+  log_abortions ~
+    distance_100 + I(distance_100^2) +
+    log_female_pop +
+    
+    # Demographic controls
+    sw0(pct_white_1519 + pct_white_2024 + pct_white_2529 +
+    pct_white_3034 + pct_white_3539 + pct_white_4044 +
+    pct_black_1519 + pct_black_2024 + pct_black_2529 +
+    pct_black_3034 + pct_black_3539 + pct_black_4044 +
+    pct_hispanic_1519 + pct_hispanic_2024 + pct_hispanic_2529 +
+    pct_hispanic_3034 + pct_hispanic_3539 + pct_hispanic_4044 +
+
+    pct_edlths + pct_edhs + pct_edscoll + pct_edcoll +
+    pct_urban +
+    
+    # Economic controls
+    urate + pctpoverty + medincome +
+    
+    # Policy controls
+    E_mwx1trip + E_mwx2trip + E_fpmedexp + E_insmand +
+    medicaid_expansion + real_maxben + familycap) |
+    
+    # Fixed effects 
+    csw(fips_code, year),
+  
+  data = abortion_data,
+  cluster = ~fips_code
+)
+
+# Covariates
+covariates <- c("pct_white_1519", "pct_white_2024", "pct_white_2529",
+                "pct_white_3034", "pct_white_3539", "pct_white_4044",
+                "pct_black_1519", "pct_black_2024", "pct_black_2529",
+                "pct_black_3034", "pct_black_3539", "pct_black_4044",
+                "pct_hispanic_1519", "pct_hispanic_2024", "pct_hispanic_2529",
+                "pct_hispanic_3034", "pct_hispanic_3539", "pct_hispanic_4044",
+                "pct_edlths", "pct_edhs", "pct_edscoll", "pct_edcoll",
+                "pct_urban", "urate", "pctpoverty", "medincome",
+                "E_mwx1trip", "E_mwx2trip", "E_fpmedexp", "E_insmand",
+                "medicaid_expansion", "real_maxben", "familycap")
+
+# Results
+summary(twfe_abortions)
+
+etable(
+  twfe_abortions, 
+  se = "cluster", 
+  cluster = ~fips_code,
+  dict = c(
+    "distance_100" = "Distance (100s mi)",
+    "I(distance_100^2)" = "Distance (100s mi) Squared"),
+  drop = covariates,
+  tex = TRUE
+)
+
+```
+
+
+```{r DiD-births}
+## TWFE DiD Births ##
+
+# Remove abortion data from merged data set
+birth_data <- abortions_births_td_controls %>% select(-abortions_total)
+birth_data <- birth_data %>%
+  mutate(births_total = ifelse(is.na(births_total), 0, births_total))
+
+# Define the states to keep
+states_to_keep_births <- c("AL", "AZ", "CO", "CT", "DE", "FL", "GA", "ID", "IA", "ME", "MA", "MI", "MN", "MO", "MT", "NV", "NH", "NJ", "NM", "NC", "ND", "OR", "OK", "PA", "SD", "VT", "WI", "WY")
+
+# Set regex pattern matching any of state abbreviations at end of string
+state_pattern <- paste0("\\(", states_to_keep_births, "\\)", collapse = "|")
+
+# Filter to keep only rows where county_name ends in a target states
+birth_data <- birth_data %>%
+  filter(str_detect(county_name, state_pattern)) 
+birth_data <- birth_data %>%
+  mutate(births_total = as.numeric(gsub(",", "", births_total)))
+
+# Prepare DiD so that distance = 100s of miles and log female pop as control
+birth_data <- birth_data %>%
+  mutate(
+    distance_100 = distance_origintodest / 100,
+    log_female_pop = log(pop_total)
+  )
+
+# Log births to be normalized (not right skewed)
+birth_data <- birth_data %>%
+  mutate(log_births = log(births_total + 1))
+
+# Run TWFE linear model for abortion counts
+twfe_births <- feols(
+  log_births ~
+    distance_100 + I(distance_100^2) +
+    log_female_pop +
+    
+    sw0(pct_white_1519 + pct_white_2024 + pct_white_2529 +
+    pct_white_3034 + pct_white_3539 + pct_white_4044 +
+    pct_black_1519 + pct_black_2024 + pct_black_2529 +
+    pct_black_3034 + pct_black_3539 + pct_black_4044 +
+    pct_hispanic_1519 + pct_hispanic_2024 + pct_hispanic_2529 +
+    pct_hispanic_3034 + pct_hispanic_3539 + pct_hispanic_4044 +
+
+    pct_edlths + pct_edhs + pct_edscoll + pct_edcoll +
+    pct_urban +
+    
+    # Economic controls
+    urate + pctpoverty + medincome +
+    
+    # Policy controls
+    E_mwx1trip + E_mwx2trip + E_fpmedexp + E_insmand +
+    medicaid_expansion + real_maxben + familycap) |
+    
+    # Fixed effects 
+    csw(fips_code, year),
+  
+  data = birth_data,
+  cluster = ~fips_code
+)
+
+# Covariates
+covariates <- c("pct_white_1519", "pct_white_2024", "pct_white_2529",
+                "pct_white_3034", "pct_white_3539", "pct_white_4044",
+                "pct_black_1519", "pct_black_2024", "pct_black_2529",
+                "pct_black_3034", "pct_black_3539", "pct_black_4044",
+                "pct_hispanic_1519", "pct_hispanic_2024", "pct_hispanic_2529",
+                "pct_hispanic_3034", "pct_hispanic_3539", "pct_hispanic_4044",
+                "pct_edlths", "pct_edhs", "pct_edscoll", "pct_edcoll",
+                "pct_urban", "urate", "pctpoverty", "medincome",
+                "E_mwx1trip", "E_mwx2trip", "E_fpmedexp", "E_insmand",
+                "medicaid_expansion", "real_maxben", "familycap")
+
+# Results
+summary(twfe_births)
+
+etable(
+  twfe_births, 
+  se = "cluster", 
+  cluster = ~fips_code,
+  dict = c(
+    "distance_100" = "Distance (100s mi)",
+    "I(distance_100^2)" = "Distance (100s mi) Squared"),
+  drop = covariates,
+  tex = TRUE
+)
+```
+
+
+Event Study Models for TWFE DiD Models on Clinical Abortions and Births 
+
+``` {r event-study-clinical-abortions}
+## Event Study Clinical Abortions ##
+
+# Assign treatment year
+abortion_data <- abortion_data %>%
+  mutate(fips_code = as.character(fips_code))
+
+distance_wide <- abortion_data %>%
+  filter(year %in% c(2021, 2022, 2023)) %>%
+  group_by(fips_code, year) %>%
+  summarise(distance = mean(distance_origintodest, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from = year,
+    values_from = distance,
+    names_prefix = "distance_"
+  )
+
+# Assign treatment year using distance threshold (e.g., >10 miles)
+first_treatment_years <- distance_wide %>%
+  mutate(
+    change_21_22 = distance_2022 - distance_2021,
+    treat_year = case_when(
+      !is.na(change_21_22) & change_21_22 > 50 ~ 2022,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(fips_code, treat_year)
+
+# Join and prepare dataset
+abortion_data_es <- abortion_data %>%
+  left_join(first_treatment_years, by = "fips_code") %>%
+  mutate(
+    treat_year = ifelse(is.na(treat_year), 0, treat_year),
+    fips_code = as.numeric(fips_code)
+  ) %>%
+  filter(treat_year %in% c(0, 2022)) %>% # only use 2022-treated + never-treated
+  filter(year >= 2012)
+
+# Subset only relevant covariates to add
+covariate_vars <- c(
+  "log_female_pop", "pct_white_1519", "pct_white_2024", "pct_white_2529",
+  "pct_white_3034", "pct_white_3539", "pct_white_4044", "pct_black_1519",
+  "pct_black_2024", "pct_black_2529", "pct_black_3034", "pct_black_3539",
+  "pct_black_4044", "pct_hispanic_1519", "pct_hispanic_2024", "pct_hispanic_2529",
+  "pct_hispanic_3034", "pct_hispanic_3539", "pct_hispanic_4044", "pct_edlths",
+  "pct_edhs", "pct_edscoll", "pct_edcoll", "pct_urban", "urate", "pctpoverty",
+  "medincome", "E_mwx1trip", "E_mwx2trip", "E_fpmedexp", "E_insmand",
+  "medicaid_expansion", "real_maxben", "familycap"
+)
+
+# Keep only pre-treatment years
+pre_treat_clean <- abortion_data_es %>%
+  filter(year < 2022)
+
+# Try a minimal set of covariates first
+minimal_covariates <- c("log_female_pop", "pct_urban", "urate", "pctpoverty", "medincome")
+xformla <- as.formula(paste("~", paste(minimal_covariates, collapse = " + ")))
+
+# Run event-study DiD model for clinical abortions
+cs_att_clinical_abortions <- att_gt(
+  yname = "log_abortions",
+  tname = "year",
+  idname = "fips_code",
+  gname = "treat_year",
+  xformla = xformla,
+  data = abortion_data_es,
+  est_method = "dr",
+  control_group = "notyettreated",
+  allow_unbalanced_panel = TRUE,
+)
+
+# Plot ATT dynamics for 2022-treated units
+ggdid(cs_att_clinical_abortions, group = 2022)
+
+# Plot with uniform confidence bands
+agg_clinical <- aggte(
+  cs_att_clinical_abortions,
+  type = "dynamic",
+  min_e = -10,
+  max_e = 1, # Include post-period for completeness
+  bstrap = TRUE,
+  cband = TRUE)
+ggdid(agg_clinical, uniform = TRUE)
+
+# Create the ggplot object
+eventstudy_ca <- ggdid(agg_clinical, uniform = TRUE) +
+  labs(
+    title = NULL,
+    x = "Event Time (Years Relative to Treatment)",
+    y = "ATT Estimate (Log Clinical Abortions)",
+    caption = "Notes: Estimates from Callaway & Sant’Anna (2021) DiD. 95% uniform confidence bands shown."
+  ) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(face = "bold", color = "black", family = "Arial"),
+    axis.text = element_text(color = "black", family = "Arial"),
+    plot.caption = element_text(hjust = 0, size = 9, color = "black", family = "Arial")
+  )
+
+# Save the plot as a high-resolution PNG
+ggsave(
+  filename = "../Figures/eventstudy_1.png",
+  plot = eventstudy_ca,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+## Joint Pre-Trends Test for Event Study Clinical Abortions ##
+
+# Update treatment groups: include 2023-treated units too
+first_treatment_years_pretrends <- distance_wide %>%
+  mutate(
+    change_21_22 = distance_2022 - distance_2021,
+    change_22_23 = distance_2023 - distance_2022,
+    treat_year = case_when(
+      !is.na(change_21_22) & change_21_22 > 50 ~ 2022,
+      !is.na(change_22_23) & change_22_23 > 50 ~ 2023,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(fips_code, treat_year)
+
+abortion_data_f <- abortion_data %>%
+  mutate(fips_code = as.character(fips_code)) %>%
+  left_join(first_treatment_years_pretrends, by = "fips_code") %>%
+  mutate(
+    treat_year = ifelse(is.na(treat_year), 0, treat_year),
+    fips_code = as.numeric(fips_code)
+  ) %>%
+  filter(year >= 2017)
+
+# Prepare data with pre-period time indicators for all groups
+abortion_data_f <- abortion_data_f %>%
+  mutate(
+    rel_time = ifelse(treat_year == 0, year - 2025, year - treat_year),  # Never-treated: huge negative rel_time
+    pre_period = ifelse(rel_time < 0 & year < treat_year, rel_time, NA)
+  )
+
+# Subset only to pre-treatment years of ALL groups
+pretrend_data <- abortion_data_f %>%
+  filter(!is.na(pre_period))
+
+# Run regression with the reduced set of covariates
+mod_pretrends_ca <- feols(
+  log_abortions ~ i(pre_period, ref = -1) + 
+    log_female_pop + pct_urban + urate + pctpoverty + medincome |
+    fips_code + year,
+  data = pretrend_data,
+  cluster = ~fips_code
+)
+
+# Test all pre-period coefficients jointly
+fixest::wald(mod_pretrends_ca, keep = "pre_period::(-5|-4|-3|-2)", cluster = ~fips_code)
+```
+
+
+```{r event-study-births}
+## Event Study Births ##
+
+# Assign treatment year
+birth_data <- birth_data %>%
+  mutate(fips_code = as.character(fips_code))
+
+distance_wide <- birth_data %>%
+  filter(year %in% c(2021, 2022, 2023)) %>%
+  group_by(fips_code, year) %>%
+  summarise(distance = mean(distance_origintodest, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from = year,
+    values_from = distance,
+    names_prefix = "distance_"
+  )
+
+# Assign treatment year using distance threshold (e.g., >10 miles)
+first_treatment_years <- distance_wide %>%
+  mutate(
+    change_21_22 = distance_2022 - distance_2021,
+    treat_year = case_when(
+      !is.na(change_21_22) & change_21_22 > 50 ~ 2022,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(fips_code, treat_year)
+
+# Join and prepare dataset
+birth_data_es <- birth_data %>%
+  left_join(first_treatment_years, by = "fips_code") %>%
+  mutate(
+    treat_year = ifelse(is.na(treat_year), 0, treat_year),
+    fips_code = as.numeric(fips_code)
+  ) %>%
+  filter(treat_year %in% c(0, 2022)) %>% # only use 2022-treated + never-treated
+  filter(year >= 2012)
+
+# Subset only relevant covariates to add
+covariate_vars <- c(
+  "log_female_pop", "pct_white_1519", "pct_white_2024", "pct_white_2529",
+  "pct_white_3034", "pct_white_3539", "pct_white_4044", "pct_black_1519",
+  "pct_black_2024", "pct_black_2529", "pct_black_3034", "pct_black_3539",
+  "pct_black_4044", "pct_hispanic_1519", "pct_hispanic_2024", "pct_hispanic_2529",
+  "pct_hispanic_3034", "pct_hispanic_3539", "pct_hispanic_4044", "pct_edlths",
+  "pct_edhs", "pct_edscoll", "pct_edcoll", "pct_urban", "urate", "pctpoverty",
+  "medincome", "E_mwx1trip", "E_mwx2trip", "E_fpmedexp", "E_insmand",
+  "medicaid_expansion", "real_maxben", "familycap"
+)
+
+# Keep only pre-treatment years
+pre_treat_clean <- birth_data_es %>%
+  filter(year < 2022)
+
+# Try a minimal set of covariates first
+minimal_covariates <- c("log_female_pop", "pct_urban", "urate", "pctpoverty", "medincome")
+xformla <- as.formula(paste("~", paste(minimal_covariates, collapse = " + ")))
+
+# Run event-study DiD model for clinical abortions
+cs_att_births <- att_gt(
+  yname = "log_births",
+  tname = "year",
+  idname = "fips_code",
+  gname = "treat_year",
+  xformla = xformla,
+  data = birth_data_es,
+  est_method = "dr",
+  control_group = "notyettreated",
+  allow_unbalanced_panel = TRUE,
+)
+
+# Plot ATT dynamics for 2022-treated units
+ggdid(cs_att_births, group = 2022)
+
+# Plot with uniform confidence bands
+agg_births <- aggte(
+  cs_att_births,
+  type = "dynamic",
+  min_e = -10,
+  max_e = 1, # Include post-period for completeness
+  bstrap = TRUE,
+  cband = TRUE)
+ggdid(agg_births, uniform = TRUE)
+
+# Create the ggplot object
+eventstudy_births <- ggdid(agg_births, uniform = TRUE) +
+  labs(
+    title = NULL,
+    x = "Event Time (Years Relative to Treatment)",
+    y = "ATT Estimate (Log Births)",
+    caption = "Notes: Estimates from Callaway & Sant’Anna (2021) DiD. 95% uniform confidence bands shown."
+  ) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(face = "bold", color = "black", family = "Arial"),
+    axis.text = element_text(color = "black", family = "Arial"),
+    plot.caption = element_text(hjust = 0, size = 9, color = "black", family = "Arial")
+  )
+
+# Save the plot as a high-resolution PNG
+ggsave(
+  filename = "../Figures/eventstudy_2.png",
+  plot = eventstudy_births,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+## Joint Pre-Trends Test for Births ##
+
+# Update treatment groups: include 2023-treated units too
+first_treatment_years_pretrends <- distance_wide %>%
+  mutate(
+    change_21_22 = distance_2022 - distance_2021,
+    change_22_23 = distance_2023 - distance_2022,
+    treat_year = case_when(
+      !is.na(change_21_22) & change_21_22 > 50 ~ 2022,
+      !is.na(change_22_23) & change_22_23 > 50 ~ 2023,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(fips_code, treat_year)
+
+birth_data_f <- birth_data %>%
+  mutate(fips_code = as.character(fips_code)) %>%
+  left_join(first_treatment_years_pretrends, by = "fips_code") %>%
+  mutate(
+    treat_year = ifelse(is.na(treat_year), 0, treat_year),
+    fips_code = as.numeric(fips_code)
+  ) %>%
+  filter(year >= 2012)
+
+# Prepare data with pre-period time indicators for all groups
+birth_data_f <- birth_data_f %>%
+  mutate(
+    rel_time = ifelse(treat_year == 0, year - 2025, year - treat_year),  # Never-treated: huge negative rel_time
+    pre_period = ifelse(rel_time < 0 & year < treat_year, rel_time, NA)
+  )
+
+# Subset only to pre-treatment years of ALL groups
+pretrend_data <- birth_data_f %>%
+  filter(!is.na(pre_period))
+
+# Run regression with the reduced set of covariates
+mod_pretrends_births <- feols(
+  log_births ~ i(pre_period, ref = -1) + 
+    log_female_pop + pct_urban + urate + pctpoverty + medincome |
+    fips_code + year,
+  data = pretrend_data,
+  cluster = ~fips_code
+)
+
+# Test all pre-period coefficients jointly
+fixest::wald(mod_pretrends_births, keep = "pre_period::(-5|-4|-3|-2)", cluster = ~fips_code)
+
+
+```
+
+```{r covariate-balance-clinical-abortions}
+## Covariate Balance Check for Clinical Abortions ##
+
+# Define treatment year per county
+group_df <- distance_wide %>%
+  mutate(
+    change_21_22 = distance_2022 - distance_2021,
+    treat_year = ifelse(!is.na(change_21_22) & change_21_22 > 0, 2022, 0)
+  ) %>%
+  select(fips_code, treat_year) %>%
+  mutate(fips_code = as.character(fips_code))
+
+# Prepare 2021 pre-treatment data
+abortion_pre <- abortion_data_es %>%
+  filter(year %in% 2018:2021) %>%
+  mutate(fips_code = as.character(fips_code)) %>%
+  left_join(group_df, by = "fips_code") %>%
+   mutate(
+    treat_year = coalesce(treat_year.x, treat_year.y),
+    treat_group = case_when(
+      treat_year == 2022 ~ "Treated_2022",
+      treat_year %in% c(2023, 0) ~ "Control",
+      TRUE ~ NA_character_
+    )) %>%
+  select(-treat_year.x, -treat_year.y) %>%  # Clean up duplicate columns
+  filter(!is.na(treat_group)) %>%
+  mutate(
+    treat_group = ifelse(treat_year == 2022, "Treated_2022", "Control"),
+    treat_group = factor(treat_group, levels = c("Control", "Treated_2022"))
+  ) %>%
+  filter(!is.na(log_abortions))  # Remove NA outcomes
+
+# Define covariates
+covars_ca <- c("log_abortions", "log_female_pop", "pct_white_1519", "pct_white_2024", "pct_white_2529",
+  "pct_white_3034", "pct_white_3539", "pct_white_4044", "pct_black_1519",
+  "pct_black_2024", "pct_black_2529", "pct_black_3034", "pct_black_3539",
+  "pct_black_4044", "pct_hispanic_1519", "pct_hispanic_2024", "pct_hispanic_2529",
+  "pct_hispanic_3034", "pct_hispanic_3539", "pct_hispanic_4044", "pct_edlths",
+  "pct_edhs", "pct_edscoll", "pct_edcoll", "pct_urban", "urate", "pctpoverty",
+  "medincome", "E_mwx1trip", "E_mwx2trip", "E_fpmedexp", "E_insmand",
+  "medicaid_expansion", "real_maxben", "familycap")
+
+# Create balance table
+bal_results_ca <- bal.tab(
+  treat_group ~ year + .,  # Include year as a variable
+  data = abortion_pre %>% 
+    select(treat_group, year, all_of(covars_ca)),
+  stats = "mean.diffs",
+  method = "weighting",  # Adjusts for year-to-year correlation
+  cluster = "year"       # Accounts for repeated measures
+)
+
+# Plot Covariate Balance in Standardized Mean Differences (SMD)
+love.plot(bal_results_ca,
+          thresholds = 0.1,
+          abs = TRUE,
+          title = "Covariate Balance Between Treatment and Control Groups (Counties with Clinical Abortion Data)",
+          subtitle = "Pre-Treatment Period (2021)",
+          position = "bottom",
+          colors = "black",
+          shapes = c(16, 17),
+          line = TRUE,
+          stars = "std") +
+  theme(legend.position = "none") +
+  labs(caption = "Standardized Mean Differences (absolute values)\nVertical lines indicate ±0.1 balance threshold")
+
+```
+
+```{r covariate-balance-births}
+## Covariate Balance Check for Births ##
+
+# Define treatment year per county
+group_df <- distance_wide %>%
+  mutate(
+    change_21_22 = distance_2022 - distance_2021,
+    treat_year = ifelse(!is.na(change_21_22) & change_21_22 > 0, 2022, 0)
+  ) %>%
+  select(fips_code, treat_year) %>%
+  mutate(fips_code = as.character(fips_code))
+
+# Prepare 2021 pre-treatment data
+births_pre <- birth_data_es %>%
+  filter(year %in% 2018:2021) %>%
+  mutate(fips_code = as.character(fips_code)) %>%
+  left_join(group_df, by = "fips_code") %>%
+   mutate(
+    treat_year = coalesce(treat_year.x, treat_year.y),
+    treat_group = case_when(
+      treat_year == 2022 ~ "Treated_2022",
+      treat_year %in% c(2023, 0) ~ "Control",
+      TRUE ~ NA_character_
+    )) %>%
+  select(-treat_year.x, -treat_year.y) %>%  # Clean up duplicate columns
+  filter(!is.na(treat_group)) %>%
+  mutate(
+    treat_group = ifelse(treat_year == 2022, "Treated_2022", "Control"),
+    treat_group = factor(treat_group, levels = c("Control", "Treated_2022"))
+  ) %>%
+  filter(!is.na(log_births))  # Remove NA outcomes
+
+# Define covariates
+covars_births <- c("log_births", "log_female_pop", "pct_white_1519", "pct_white_2024", "pct_white_2529",
+  "pct_white_3034", "pct_white_3539", "pct_white_4044", "pct_black_1519",
+  "pct_black_2024", "pct_black_2529", "pct_black_3034", "pct_black_3539",
+  "pct_black_4044", "pct_hispanic_1519", "pct_hispanic_2024", "pct_hispanic_2529",
+  "pct_hispanic_3034", "pct_hispanic_3539", "pct_hispanic_4044", "pct_edlths",
+  "pct_edhs", "pct_edscoll", "pct_edcoll", "pct_urban", "urate", "pctpoverty",
+  "medincome", "E_mwx1trip", "E_mwx2trip", "E_fpmedexp", "E_insmand",
+  "medicaid_expansion", "real_maxben", "familycap")
+
+# Create balance table
+bal_results_births <- bal.tab(
+  treat_group ~ year + .,  # Include year as a variable
+  data = births_pre %>% 
+    select(treat_group, year, all_of(covars_births)),
+  stats = "mean.diffs",
+  method = "weighting",  # Adjusts for year-to-year correlation
+  cluster = "year"       # Accounts for repeated measures
+)
+
+# Plot Covariate Balance in Standardized Mean Differences (SMD)
+love.plot(bal_results_births,
+          thresholds = 0.1,
+          abs = TRUE,
+          title = "Covariate Balance Between Treatment and Control Groups (Counties with Birth Data)",
+          subtitle = "Pre-Treatment Period (2021)",
+          position = "bottom",
+          colors = "black",
+          shapes = c(16, 17),
+          line = TRUE,
+          stars = "std") +
+  theme(legend.position = "none") +
+  labs(caption = "Standardized Mean Differences (absolute values)\nVertical lines indicate ±0.1 balance threshold")
+
+```
+
+```{r fect-estimator-clinical-aborions}
+## FEct Estimator Clinical Abortions ##
+
+# Identify first treatment year per county
+treatment_timing <- abortion_data %>%
+  group_by(fips_code) %>%
+  arrange(year) %>%
+  mutate(
+    change_distance = distance_origintodest - lag(distance_origintodest),
+    treated = ifelse(!is.na(change_distance) & change_distance > 0, 1, 0)
+  ) %>%
+  group_by(fips_code) %>%
+  mutate(first_treat_year = ifelse(any(treated == 1), min(year[treated == 1]), Inf)) %>%
+  ungroup()
+
+# Create treatment dummy (1 after treatment year)
+treatment_panel <- treatment_timing %>%
+  mutate(
+    D = ifelse(year >= first_treat_year, 1, 0),
+    first_treat_year = ifelse(first_treat_year == Inf, NA, first_treat_year)
+  ) %>%
+  filter(year >= 2015 & year <= 2023)
+
+# Balance panel: keep counties with complete data 2015–2023
+complete_fips <- treatment_panel %>%
+  group_by(fips_code) %>%
+  summarise(n_years = n()) %>%
+  filter(n_years == length(2015:2023)) %>%
+  pull(fips_code)
+
+treatment_panel <- treatment_panel %>%
+  filter(fips_code %in% complete_fips)
+
+# Create numeric unit and time IDs
+treatment_panel <- treatment_panel %>%
+  mutate(
+    unit = as.numeric(factor(fips_code)),
+    time = year - min(year) + 1  # So time starts at 1
+  )
+
+fect_clinical_abortions <- fect(
+  Y = "log_abortions",
+  D = "D",
+  data = treatment_panel,
+  index = c("unit", "time"),
+  method = "ife",
+  force = "two-way",
+  se = TRUE
+)
+
+# Visualize results
+summary(fect_clinical_abortions)
+plot(fect_clinical_abortions, main = "", ylab = "Log(Clinical Abortions)", xlab = "Time Since Treatment Onset")
+```
+
+```{r fect-estimator-births}
+## FEct Estimator Births ##
+
+# Identify first treatment year per county
+treatment_timing <- birth_data %>%
+  group_by(fips_code) %>%
+  arrange(year) %>%
+  mutate(
+    change_distance = distance_origintodest - lag(distance_origintodest),
+    treated = ifelse(!is.na(change_distance) & change_distance > 0, 1, 0)
+  ) %>%
+  group_by(fips_code) %>%
+  mutate(first_treat_year = ifelse(any(treated == 1), min(year[treated == 1]), Inf)) %>%
+  ungroup()
+
+# Create treatment dummy (1 after treatment year)
+treatment_panel <- treatment_timing %>%
+  mutate(
+    D = ifelse(year >= first_treat_year, 1, 0),
+    first_treat_year = ifelse(first_treat_year == Inf, NA, first_treat_year)
+  ) %>%
+  filter(year >= 2015 & year <= 2023)
+
+# Balance panel: keep counties with complete data 2015–2023
+complete_fips <- treatment_panel %>%
+  group_by(fips_code) %>%
+  summarise(n_years = n()) %>%
+  filter(n_years == length(2015:2023)) %>%
+  pull(fips_code)
+
+treatment_panel <- treatment_panel %>%
+  filter(fips_code %in% complete_fips)
+
+# Create numeric unit and time IDs
+treatment_panel <- treatment_panel %>%
+  mutate(
+    unit = as.numeric(factor(fips_code)),
+    time = year - min(year) + 1  # So time starts at 1
+  )
+
+fect_births <- fect(
+  Y = "log_births",
+  D = "D",
+  data = treatment_panel,
+  index = c("unit", "time"),
+  method = "ife",
+  force = "two-way",
+  se = TRUE
+)
+
+# Visualize results
+summary(fect_births)
+plot(fect_births, main = "", ylab = "Log(Births)", xlab = "Time Since Treatment Onset")
+```
+
+
+```{r placebo-testing-clinical-abortions}
+## Placebo Treatment Year Test - Clinical Abortions ##
+
+# Assign first treatment year per county (based on change in distance)
+placebo_ca <- abortion_data %>%
+  arrange(fips_code, year) %>%
+  group_by(fips_code) %>%
+  mutate(
+    change_distance = distance_origintodest - lag(distance_origintodest),
+    treated = ifelse(!is.na(change_distance) & change_distance > 0, 1, 0),
+    first_treat_year = ifelse(any(treated == 1), min(year[treated == 1]), NA_integer_)
+  ) %>%
+  ungroup()
+
+# Assign placebo treatment in 2020 to counties that are actually treated in 2022 or 2023
+placebo_ca <- placebo_ca %>%
+  filter(year >= 2015 & year <= 2021) %>%  # Use pre-treatment window
+  mutate(
+    placebo_treated = ifelse(first_treat_year %in% c(2022, 2023), 1, 0),
+    D_placebo = ifelse(placebo_treated == 1 & year >= 2020, 1, 0)
+  )
+
+# Estimate Placebo Event Study
+placebo_model_ca <- feols(
+  log_abortions ~ D_placebo + log_female_pop +
+    
+    pct_white_1519 + pct_white_2024 + pct_white_2529 +
+    pct_white_3034 + pct_white_3539 + pct_white_4044 +
+    pct_black_1519 + pct_black_2024 + pct_black_2529 +
+    pct_black_3034 + pct_black_3539 + pct_black_4044 +
+    pct_hispanic_1519 + pct_hispanic_2024 + pct_hispanic_2529 +
+    pct_hispanic_3034 + pct_hispanic_3539 + pct_hispanic_4044 +
+
+    pct_edlths + pct_edhs + pct_edscoll + pct_edcoll +
+    pct_urban +
+    
+    # Economic controls
+    urate + pctpoverty + medincome +
+    
+    # Policy controls
+    E_mwx1trip + E_mwx2trip + E_fpmedexp + E_insmand +
+    medicaid_expansion + real_maxben + familycap| fips_code + year,
+  
+  data = placebo_ca
+)
+
+# Covariates
+covariates <- c("pct_white_1519", "pct_white_2024", "pct_white_2529",
+                "pct_white_3034", "pct_white_3539", "pct_white_4044",
+                "pct_black_1519", "pct_black_2024", "pct_black_2529",
+                "pct_black_3034", "pct_black_3539", "pct_black_4044",
+                "pct_hispanic_1519", "pct_hispanic_2024", "pct_hispanic_2529",
+                "pct_hispanic_3034", "pct_hispanic_3539", "pct_hispanic_4044",
+                "pct_edlths", "pct_edhs", "pct_edscoll", "pct_edcoll",
+                "pct_urban", "urate", "pctpoverty", "medincome",
+                "E_mwx1trip", "E_mwx2trip", "E_fpmedexp", "E_insmand",
+                "medicaid_expansion", "real_maxben", "familycap")
+
+# View results
+summary(placebo_model_ca)
+etable(
+  placebo_model_ca, 
+  se = "cluster",
+  cluster = ~fips_code,
+  dict = c("D_placebo" = "Placebo Treatment (Post-2020)", "log_female_pop" = "Log(Female Population)"),
+  drop = covariates,
+  tex = TRUE
+)
+
+```
+
+
+
+```{r placebo-testing-births}
+## Placebo Treatment Year Test - Births ##
+
+# Assign first treatment year per county (based on change in distance)
+placebo_births <- birth_data %>%
+  arrange(fips_code, year) %>%
+  group_by(fips_code) %>%
+  mutate(
+    change_distance = distance_origintodest - lag(distance_origintodest),
+    treated = ifelse(!is.na(change_distance) & change_distance > 0, 1, 0),
+    first_treat_year = ifelse(any(treated == 1), min(year[treated == 1]), NA_integer_)
+  ) %>%
+  ungroup()
+
+# Assign placebo treatment in 2020 to counties that are actually treated in 2022 or 2023
+placebo_births <- placebo_births %>%
+  filter(year >= 2015 & year <= 2021) %>%  # Use pre-treatment window
+  mutate(
+    placebo_treated = ifelse(first_treat_year %in% c(2022, 2023), 1, 0),
+    D_placebo = ifelse(placebo_treated == 1 & year >= 2020, 1, 0)
+  )
+
+# Estimate Placebo Event Study
+placebo_model_births <- feols(
+  log_births ~ D_placebo + log_female_pop +
+    
+    pct_white_1519 + pct_white_2024 + pct_white_2529 +
+    pct_white_3034 + pct_white_3539 + pct_white_4044 +
+    pct_black_1519 + pct_black_2024 + pct_black_2529 +
+    pct_black_3034 + pct_black_3539 + pct_black_4044 +
+    pct_hispanic_1519 + pct_hispanic_2024 + pct_hispanic_2529 +
+    pct_hispanic_3034 + pct_hispanic_3539 + pct_hispanic_4044 +
+
+    pct_edlths + pct_edhs + pct_edscoll + pct_edcoll +
+    pct_urban +
+    
+    # Economic controls
+    urate + pctpoverty + medincome +
+    
+    # Policy controls
+    E_mwx1trip + E_mwx2trip + E_fpmedexp + E_insmand +
+    medicaid_expansion + real_maxben + familycap| fips_code + year,
+  
+  data = placebo_births
+)
+
+# Covariates
+covariates <- c("pct_white_1519", "pct_white_2024", "pct_white_2529",
+                "pct_white_3034", "pct_white_3539", "pct_white_4044",
+                "pct_black_1519", "pct_black_2024", "pct_black_2529",
+                "pct_black_3034", "pct_black_3539", "pct_black_4044",
+                "pct_hispanic_1519", "pct_hispanic_2024", "pct_hispanic_2529",
+                "pct_hispanic_3034", "pct_hispanic_3539", "pct_hispanic_4044",
+                "pct_edlths", "pct_edhs", "pct_edscoll", "pct_edcoll",
+                "pct_urban", "urate", "pctpoverty", "medincome",
+                "E_mwx1trip", "E_mwx2trip", "E_fpmedexp", "E_insmand",
+                "medicaid_expansion", "real_maxben", "familycap")
+
+# View results
+summary(placebo_model_births)
+etable(
+  placebo_model_births, 
+  se = "cluster",
+  cluster = ~fips_code,
+  dict = c("D_placebo" = "Placebo Treatment (Post-2020)", "log_female_pop" = "Log(Female Population)"),
+  drop = covariates,
+  tex = TRUE
+)
+```
+
+
+
+```{r twfe-did-only-county-fes}
+# Run TWFE linear model for abortion counts
+twfe_abortions2 <- feols(
+  log_abortions ~
+    distance_100 + I(distance_100^2) +
+    log_female_pop | fips_code,
+  data = abortion_data,
+  cluster = ~fips_code
+)
+
+etable(
+  twfe_abortions2, 
+  se = "cluster", 
+  cluster = ~fips_code,
+  dict = c(
+    "distance_100" = "Distance (100s mi)",
+    "I(distance_100^2)" = "Distance (100s mi) Squared"),
+  tex = TRUE
+)
+
+
+# Run TWFE linear model for abortion counts
+twfe_births2 <- feols(
+  log_births ~
+    distance_100 + I(distance_100^2) +
+    log_female_pop | fips_code,
+  data = birth_data,
+  cluster = ~fips_code
+)
+
+etable(
+  twfe_births2, 
+  se = "cluster", 
+  cluster = ~fips_code,
+  dict = c(
+    "distance_100" = "Distance (100s mi)",
+    "I(distance_100^2)" = "Distance (100s mi) Squared"),
+  tex = TRUE
+)
+
+```
